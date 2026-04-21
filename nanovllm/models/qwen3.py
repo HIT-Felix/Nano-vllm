@@ -1,12 +1,18 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanovllm.layers.linear import (
+    QKVParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -117,6 +123,68 @@ class Qwen3MLP(nn.Module):
         return x
 
 
+class Qwen3MoeMLP(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+    ) -> None:
+        super().__init__()
+        self.gate_proj = ReplicatedLinear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = ReplicatedLinear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = ReplicatedLinear(intermediate_size, hidden_size, bias=False)
+        assert hidden_act == "silu"
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Qwen3SparseMoeBlock(nn.Module):
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+    ) -> None:
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        self.gate = ReplicatedLinear(config.hidden_size, self.num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            Qwen3MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                hidden_act=config.hidden_act,
+            )
+            for _ in range(self.num_experts)
+        ])
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flat_states = hidden_states.reshape(-1, hidden_dim)
+        router_logits = self.gate(flat_states)
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(flat_states.dtype)
+
+        final_hidden_states = flat_states.new_zeros(flat_states.shape)
+        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx.item()
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_hidden_states = flat_states[token_idx]
+            current_hidden_states = self.experts[expert_idx](current_hidden_states)
+            current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states)
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+
 class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
@@ -159,6 +227,16 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+    ) -> None:
+        super().__init__(config)
+        self.mlp = Qwen3SparseMoeBlock(config)
+
+
 class Qwen3Model(nn.Module):
 
     def __init__(
@@ -181,6 +259,18 @@ class Qwen3Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+
+class Qwen3MoeModel(Qwen3Model):
+
+    def __init__(
+        self,
+        config: Qwen3Config,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([Qwen3MoeDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -214,3 +304,21 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+
+class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+    }
+
+    def __init__(
+        self,
+        config: Qwen3Config
+    ) -> None:
+        nn.Module.__init__(self)
+        self.model = Qwen3MoeModel(config)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        if config.tie_word_embeddings:
+            self.lm_head.weight.data = self.model.embed_tokens.weight.data
