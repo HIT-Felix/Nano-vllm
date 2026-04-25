@@ -163,8 +163,14 @@ class Qwen3SparseMoeBlock(nn.Module):
         ])
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        flat_states = hidden_states.reshape(-1, hidden_dim)
+        orig_shape = hidden_states.shape
+        if hidden_states.ndim == 2:
+            flat_states = hidden_states
+        elif hidden_states.ndim == 3:
+            flat_states = hidden_states.reshape(-1, hidden_states.size(-1))
+        else:
+            raise ValueError(f"unexpected hidden_states shape: {orig_shape}")
+        hidden_dim = flat_states.size(-1)
         router_logits = self.gate(flat_states)
         routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -182,7 +188,7 @@ class Qwen3SparseMoeBlock(nn.Module):
             current_hidden_states = self.experts[expert_idx](current_hidden_states)
             current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states)
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states.reshape(orig_shape)
 
 
 class Qwen3DecoderLayer(nn.Module):
