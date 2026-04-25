@@ -35,10 +35,14 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            return
+        model_runner.call("exit")
+        self.model_runner = None
         for p in self.ps:
             p.join()
+        self.ps.clear()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
