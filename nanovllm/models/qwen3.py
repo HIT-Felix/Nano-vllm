@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from dataclasses import dataclass
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
@@ -15,6 +16,14 @@ from nanovllm.layers.linear import (
 )
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+
+
+@dataclass(slots=True)
+class Qwen3MoeStats:
+    num_calls: int = 0
+    num_tokens: int = 0
+    num_dispatches: int = 0
+    expert_histogram: list[int] | None = None
 
 
 class Qwen3Attention(nn.Module):
@@ -152,6 +161,7 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        self.stats = Qwen3MoeStats(expert_histogram=[0] * self.num_experts)
         self.gate = ReplicatedLinear(config.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList([
             Qwen3MoeMLP(
@@ -171,12 +181,18 @@ class Qwen3SparseMoeBlock(nn.Module):
         else:
             raise ValueError(f"unexpected hidden_states shape: {orig_shape}")
         hidden_dim = flat_states.size(-1)
+        self.stats.num_calls += 1
+        self.stats.num_tokens += flat_states.size(0)
         router_logits = self.gate(flat_states)
         routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self.norm_topk_prob:
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(flat_states.dtype)
+        self.stats.num_dispatches += selected_experts.numel()
+        expert_hist = torch.bincount(selected_experts.flatten(), minlength=self.num_experts).tolist()
+        for idx, count in enumerate(expert_hist):
+            self.stats.expert_histogram[idx] += count
 
         final_hidden_states = flat_states.new_zeros(flat_states.shape)
         expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
@@ -189,6 +205,17 @@ class Qwen3SparseMoeBlock(nn.Module):
             current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states)
         return final_hidden_states.reshape(orig_shape)
+
+    def reset_stats(self):
+        self.stats = Qwen3MoeStats(expert_histogram=[0] * self.num_experts)
+
+    def get_stats(self) -> Qwen3MoeStats:
+        return Qwen3MoeStats(
+            num_calls=self.stats.num_calls,
+            num_tokens=self.stats.num_tokens,
+            num_dispatches=self.stats.num_dispatches,
+            expert_histogram=list(self.stats.expert_histogram),
+        )
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -278,6 +305,41 @@ class Qwen3MoeModel(Qwen3Model):
         self.layers = nn.ModuleList([Qwen3MoeDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def reset_moe_stats(self):
+        for layer in self.layers:
+            layer.mlp.reset_stats()
+
+    def get_moe_stats(self) -> dict:
+        layer_stats = []
+        total_calls = total_tokens = total_dispatches = 0
+        aggregate_hist = None
+        for layer_idx, layer in enumerate(self.layers):
+            stats = layer.mlp.get_stats()
+            total_calls += stats.num_calls
+            total_tokens += stats.num_tokens
+            total_dispatches += stats.num_dispatches
+            if aggregate_hist is None:
+                aggregate_hist = [0] * len(stats.expert_histogram)
+            for idx, count in enumerate(stats.expert_histogram):
+                aggregate_hist[idx] += count
+            layer_stats.append(
+                dict(
+                    layer=layer_idx,
+                    num_calls=stats.num_calls,
+                    num_tokens=stats.num_tokens,
+                    num_dispatches=stats.num_dispatches,
+                    expert_histogram=stats.expert_histogram,
+                )
+            )
+        return dict(
+            num_layers=len(self.layers),
+            total_calls=total_calls,
+            total_tokens=total_tokens,
+            total_dispatches=total_dispatches,
+            aggregate_expert_histogram=aggregate_hist,
+            layers=layer_stats,
+        )
+
 
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
@@ -328,3 +390,9 @@ class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
+
+    def reset_moe_stats(self):
+        self.model.reset_moe_stats()
+
+    def get_moe_stats(self) -> dict:
+        return self.model.get_moe_stats()

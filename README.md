@@ -43,6 +43,21 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Qwen3 MoE Smoke Test
+
+For the single-GPU `Qwen3-30B-A3B` bring-up path, use `example_qwen3_moe.py`:
+
+```bash
+python example_qwen3_moe.py \
+  --model /YOUR/MODEL/PATH/Qwen3-30B-A3B \
+  --max-model-len 1024 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 1024
+```
+
+The script prints both generated text and a small MoE routing summary so you can verify
+that experts are actually being exercised after each code change.
+
 ## Benchmark
 
 See `bench.py` for benchmark.

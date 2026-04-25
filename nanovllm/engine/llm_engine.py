@@ -61,6 +61,17 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    def reset_moe_stats(self):
+        model = getattr(self.model_runner, "model", None)
+        if model is not None and hasattr(model, "reset_moe_stats"):
+            model.reset_moe_stats()
+
+    def get_moe_stats(self) -> dict | None:
+        model = getattr(self.model_runner, "model", None)
+        if model is not None and hasattr(model, "get_moe_stats"):
+            return model.get_moe_stats()
+        return None
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],
