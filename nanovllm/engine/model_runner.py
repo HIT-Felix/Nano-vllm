@@ -8,6 +8,10 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM, Qwen3MoeForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.parallel_state import (
+    get_tp_size,
+    initialize_parallel_state,
+)
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -26,11 +30,14 @@ class ModelRunner:
         self.enforce_eager = config.enforce_eager
         if hf_config.model_type == "qwen3_moe":
             self.enforce_eager = True
-        self.world_size = config.tensor_parallel_size
+        self.tp_size = config.tensor_parallel_size
+        self.ep_size = config.expert_parallel_size
+        self.world_size = self.tp_size * self.ep_size
         self.rank = rank
         self.event = event
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        initialize_parallel_state(self.tp_size, self.ep_size, rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -117,7 +124,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads // get_tp_size()
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes

@@ -14,6 +14,7 @@ def parse_args():
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    parser.add_argument("--expert-parallel-size", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.7)
     return parser.parse_args()
@@ -24,6 +25,7 @@ def main():
     llm = LLM(
         args.model,
         tensor_parallel_size=1,
+        expert_parallel_size=args.expert_parallel_size,
         enforce_eager=True,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,

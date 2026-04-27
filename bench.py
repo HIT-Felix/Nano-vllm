@@ -20,6 +20,7 @@ def parse_args():
     parser.add_argument("--max-output-len", type=int, default=128, help="Maximum output token length.")
     parser.add_argument("--max-model-len", type=int, default=2048, help="Maximum model length.")
     parser.add_argument("--max-num-seqs", type=int, default=16, help="Engine max_num_seqs.")
+    parser.add_argument("--expert-parallel-size", type=int, default=1, help="Engine expert_parallel_size.")
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
@@ -42,6 +43,8 @@ def main():
 
     llm = LLM(
         args.model,
+        tensor_parallel_size=1,
+        expert_parallel_size=args.expert_parallel_size,
         enforce_eager=args.enforce_eager,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
@@ -79,6 +82,7 @@ def main():
         f"Engine: max_model_len={args.max_model_len}, "
         f"max_num_seqs={args.max_num_seqs}, "
         f"max_num_batched_tokens={args.max_num_batched_tokens}, "
+        f"expert_parallel_size={args.expert_parallel_size}, "
         f"enforce_eager={args.enforce_eager}"
     )
     print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")

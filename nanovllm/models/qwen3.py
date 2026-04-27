@@ -16,6 +16,7 @@ from nanovllm.layers.linear import (
 )
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.parallel_state import get_ep_group, get_ep_rank, get_ep_size, get_tp_size
 
 
 @dataclass(slots=True)
@@ -41,7 +42,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -162,15 +163,25 @@ class Qwen3SparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
         self.stats = Qwen3MoeStats(expert_histogram=[0] * self.num_experts)
+        self.ep_rank = get_ep_rank()
+        self.ep_size = get_ep_size()
         self.gate = ReplicatedLinear(config.hidden_size, self.num_experts, bias=False)
+        assert self.num_experts % self.ep_size == 0
+        self.local_num_experts = self.num_experts // self.ep_size
+        self.expert_start_idx = self.ep_rank * self.local_num_experts
+        self.expert_end_idx = self.expert_start_idx + self.local_num_experts
         self.experts = nn.ModuleList([
             Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size,
                 hidden_act=config.hidden_act,
             )
-            for _ in range(self.num_experts)
+            for _ in range(self.local_num_experts)
         ])
+        self.global_to_local_expert = {
+            global_idx: global_idx - self.expert_start_idx
+            for global_idx in range(self.expert_start_idx, self.expert_end_idx)
+        }
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
@@ -199,11 +210,16 @@ class Qwen3SparseMoeBlock(nn.Module):
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_idx in expert_hit:
             expert_idx = expert_idx.item()
+            local_expert_idx = self.global_to_local_expert.get(expert_idx)
+            if local_expert_idx is None:
+                continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_hidden_states = flat_states[token_idx]
-            current_hidden_states = self.experts[expert_idx](current_hidden_states)
+            current_hidden_states = self.experts[local_expert_idx](current_hidden_states)
             current_hidden_states = current_hidden_states * routing_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states)
+        if self.ep_size > 1:
+            dist.all_reduce(final_hidden_states, group=get_ep_group())
         return final_hidden_states.reshape(orig_shape)
 
     def reset_stats(self):
@@ -396,3 +412,25 @@ class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
 
     def get_moe_stats(self) -> dict:
         return self.model.get_moe_stats()
+
+    def remap_weight_name(self, weight_name: str) -> str | None:
+        if ".mlp.experts." not in weight_name:
+            return weight_name
+        parts = weight_name.split(".")
+        expert_pos = parts.index("experts") + 1
+        global_expert_idx = int(parts[expert_pos])
+        layer = None
+        for part in parts:
+            if part == "layers":
+                break
+        local_block = None
+        try:
+            layer_idx = int(parts[parts.index("layers") + 1])
+            local_block = self.model.layers[layer_idx].mlp
+        except (ValueError, IndexError, AttributeError):
+            return weight_name
+        local_expert_idx = local_block.global_to_local_expert.get(global_expert_idx)
+        if local_expert_idx is None:
+            return None
+        parts[expert_pos] = str(local_expert_idx)
+        return ".".join(parts)
